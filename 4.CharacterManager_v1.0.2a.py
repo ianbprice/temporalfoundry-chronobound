@@ -1,9 +1,16 @@
 """
-ChronoBound CharacterManager v1.0.2
-===================================
+ChronoBound CharacterManager v1.0.2a
+====================================
 
 Enhanced character management system with atomic operations, advanced validation,
 LRU caching, system conversion, and comprehensive filtering capabilities.
+
+Changelog v1.0.2a:
+- Validation compatibility: Handle both modern ValidationResult and legacy dict formats
+- System conversion validates against target ruleset (with optional system_loader)
+- Rule-system filtering uses prefix matching (not substring)
+- Cache flush updates metadata before save
+- Cache statistics track hit/miss ratios
 
 Key improvements in v1.0.2:
 - ValidationResult with IntEnum severity levels  
@@ -29,7 +36,7 @@ import time
 import os
 import re
 import hashlib
-from typing import Dict, List, Optional, Any, Union, Tuple, Callable, Protocol
+from typing import Dict, List, Optional, Any, Union, Tuple, Callable, Protocol, Mapping
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from datetime import datetime, timedelta
@@ -130,7 +137,7 @@ class ValidationResult:
 @dataclass 
 class CharacterMetadata:
     """Per-character metadata for versioning and integrity."""
-    schema_version: str = "1.0.2"
+    schema_version: str = "1.0.2a"
     rule_system_version: str = "unknown"
     content_hash: str = ""
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
@@ -168,7 +175,7 @@ class CharacterManager:
     - Atomic filesystem operations with temp files
     - LRU cache with configurable size and targeted invalidation
     - Advanced validation with severity levels
-    - System conversion capabilities
+    - System conversion capabilities with target validation
     - ISO date filtering and robust enum coercion
     - Event hooks for lifecycle events
     - Optional inter-process file locking
@@ -181,7 +188,8 @@ class CharacterManager:
                  max_cache_entries: int = 100,
                  cache_ttl: int = 3600,
                  enable_file_locking: bool = False,
-                 validate_on_save: bool = True):
+                 validate_on_save: bool = True,
+                 system_loader: Optional[Callable[[RuleSystemType], IRuleSystem]] = None):
         """Initialize the character manager."""
         self.rule_system = rule_system
         self.storage_path = Path(storage_path)
@@ -193,8 +201,15 @@ class CharacterManager:
         self._character_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
         self._cache_timestamps: Dict[str, float] = {}
         
+        # Cache statistics tracking
+        self._cache_hits: int = 0
+        self._cache_misses: int = 0
+        
         # Validation settings
         self.validate_on_save = validate_on_save
+        
+        # System conversion support
+        self.system_loader = system_loader
         
         # File locking (optional)
         self.enable_file_locking = enable_file_locking and HAS_PORTALOCKER
@@ -253,7 +268,8 @@ class CharacterManager:
         """Get file path for character data."""
         return self.storage_path / f"{character_id}.json"
     
-    def _atomic_write_character(self, character_id: str, data: Dict[str, Any]) -> ValidationResult:
+    def _atomic_write_character(self, character_id: str, 
+                              data: Dict[str, Any]) -> ValidationResult:
         """Atomically write character data to filesystem."""
         file_path = self._get_character_path(character_id)
         temp_path = file_path.with_suffix('.tmp')
@@ -307,7 +323,8 @@ class CharacterManager:
         """Calculate SHA256 hash of canonicalized character data."""
         # Create copy without metadata for hashing
         hashable_data = {k: v for k, v in character.items() if k != "_metadata"}
-        canonical_json = json.dumps(hashable_data, sort_keys=True, separators=(',', ':'))
+        canonical_json = json.dumps(hashable_data, sort_keys=True, 
+                                   separators=(',', ':'))
         return hashlib.sha256(canonical_json.encode()).hexdigest()
     
     def _update_metadata(self, character: Dict[str, Any]) -> None:
@@ -346,9 +363,10 @@ class CharacterManager:
                 self._cache_timestamps.pop(oldest_id, None)
     
     def _get_cached_character(self, character_id: str) -> Optional[Dict[str, Any]]:
-        """Get character from cache if valid (LRU access)."""
+        """Get character from cache if valid (LRU access with hit/miss tracking)."""
         with self._lock:
             if character_id not in self._character_cache:
+                self._cache_misses += 1
                 return None
             
             # Check TTL
@@ -356,11 +374,13 @@ class CharacterManager:
             if time.time() - timestamp > self.cache_ttl:
                 del self._character_cache[character_id]
                 self._cache_timestamps.pop(character_id, None)
+                self._cache_misses += 1
                 return None
             
-            # Move to end (most recently used)
+            # Cache hit - move to end (most recently used)
             character = self._character_cache.pop(character_id)
             self._character_cache[character_id] = character
+            self._cache_hits += 1
             
             return copy.deepcopy(character)
     
@@ -378,8 +398,55 @@ class CharacterManager:
     # VALIDATION
     # ==========================================
     
+    def _normalize_validation_result(self, 
+                                   validation_result: Union[ValidationResult, 
+                                                          Mapping[str, Any]]) -> ValidationResult:
+        """
+        Normalize validation results from IRuleSystem into our ValidationResult format.
+        Handles both modern ValidationResult objects and legacy dict mappings.
+        """
+        result = ValidationResult()
+        
+        # Handle modern ValidationResult objects
+        if hasattr(validation_result, 'is_valid'):
+            result.is_valid = validation_result.is_valid
+            
+            # Copy severity if available
+            if hasattr(validation_result, 'severity'):
+                result.severity = validation_result.severity
+            
+            # Copy issues if available
+            if hasattr(validation_result, 'issues') and validation_result.issues:
+                result.issues.extend(validation_result.issues)
+            
+            # Copy legacy lists if available
+            if hasattr(validation_result, 'warnings') and validation_result.warnings:
+                for warning in validation_result.warnings:
+                    result.add_issue(warning, ValidationSeverity.WARNING, 
+                                   code="RULE_SYSTEM")
+            
+            if hasattr(validation_result, 'errors') and validation_result.errors:
+                for error in validation_result.errors:
+                    result.add_issue(error, ValidationSeverity.ERROR, 
+                                   code="RULE_SYSTEM")
+        
+        # Handle legacy dict mappings
+        elif isinstance(validation_result, Mapping):
+            result.is_valid = validation_result.get("is_valid", True)
+            
+            # Process errors and warnings from legacy format
+            for error in validation_result.get("errors", []):
+                result.add_issue(f"Rule system error: {error}", ValidationSeverity.ERROR, 
+                               code="RULE_SYSTEM")
+            
+            for warning in validation_result.get("warnings", []):
+                result.add_issue(f"Rule system warning: {warning}", 
+                               ValidationSeverity.WARNING, code="RULE_SYSTEM")
+        
+        return result
+    
     def validate_character(self, character: Dict[str, Any]) -> ValidationResult:
-        """Validate character data with severity-based issues."""
+        """Validate character data with severity-based issues and compatibility."""
         result = ValidationResult()
         
         # Basic structure validation
@@ -401,16 +468,22 @@ class CharacterManager:
                 result.add_issue("Invalid character ID format", 
                                ValidationSeverity.ERROR, field="id", code="INVALID_ID")
         
-        # Rule system validation
+        # Rule system validation with compatibility handling
         try:
             system_validation = self.rule_system.validate_character(character)
-            if not system_validation.get("is_valid", True):
-                for error in system_validation.get("errors", []):
-                    result.add_issue(f"Rule system error: {error}", 
-                                   ValidationSeverity.ERROR, code="RULE_SYSTEM")
-                for warning in system_validation.get("warnings", []):
-                    result.add_issue(f"Rule system warning: {warning}", 
-                                   ValidationSeverity.WARNING, code="RULE_SYSTEM")
+            normalized_result = self._normalize_validation_result(system_validation)
+            
+            # Merge normalized results
+            result.issues.extend(normalized_result.issues)
+            if normalized_result.severity > result.severity:
+                result.severity = normalized_result.severity
+            if not normalized_result.is_valid:
+                result.is_valid = False
+            
+            # Merge legacy lists for backwards compatibility
+            result.warnings.extend(normalized_result.warnings)
+            result.errors.extend(normalized_result.errors)
+            
         except Exception as e:
             result.add_issue(f"Rule system validation failed: {e}", 
                            ValidationSeverity.ERROR, code="VALIDATION_EXCEPTION")
@@ -477,7 +550,8 @@ class CharacterManager:
         # Validate and save
         validation_result = self.save_character(character)
         
-        if not validation_result.is_valid and validation_result.severity >= ValidationSeverity.ERROR:
+        if (not validation_result.is_valid and 
+            validation_result.severity >= ValidationSeverity.ERROR):
             raise ValueError(f"Character creation failed validation: {validation_result.issues}")
         
         return character_id
@@ -595,7 +669,8 @@ class CharacterManager:
         
         return None
     
-    def _stable_sort_key(self, character: Dict[str, Any], sort_field: str) -> Tuple[str, Any]:
+    def _stable_sort_key(self, character: Dict[str, Any], 
+                        sort_field: str) -> Tuple[str, Any]:
         """Generate stable sort key that avoids cross-type comparisons."""
         value = character.get(sort_field, "")
         
@@ -646,26 +721,30 @@ class CharacterManager:
         for character in characters:
             # Name pattern matching
             if filters.name_pattern:
-                if not re.search(filters.name_pattern, character.get("name", ""), re.IGNORECASE):
+                if not re.search(filters.name_pattern, character.get("name", ""), 
+                                re.IGNORECASE):
                     continue
             
             # Character type filtering with robust enum coercion
             if filters.character_type:
-                char_type = self._robust_enum_coercion(character.get("character_type"), CharacterType)
+                char_type = self._robust_enum_coercion(character.get("character_type"), 
+                                                     CharacterType)
                 if char_type != filters.character_type:
                     continue
             
             # Status filtering with robust enum coercion
             if filters.status:
-                status = self._robust_enum_coercion(character.get("status"), CharacterStatus)
+                status = self._robust_enum_coercion(character.get("status"), 
+                                                  CharacterStatus)
                 if status != filters.status:
                     continue
             
-            # Rule system filtering
+            # Rule system filtering with prefix matching
             if filters.rule_system:
                 metadata = character.get("_metadata", {})
-                char_rule_system = metadata.get("rule_system_version", "unknown")
-                if filters.rule_system.value not in char_rule_system:
+                char_rule_system = metadata.get("rule_system_version", "unknown").lower()
+                filter_value = filters.rule_system.value.lower()
+                if not char_rule_system.startswith(filter_value):
                     continue
             
             # Level range filtering
@@ -736,8 +815,12 @@ class CharacterManager:
     # SYSTEM CONVERSION
     # ==========================================
     
-    def convert_character_system(self, character_id: str, target: RuleSystemType) -> ValidationResult:
-        """Convert character between rule systems using export/import."""
+    def convert_character_system(self, character_id: str, 
+                               target: RuleSystemType) -> ValidationResult:
+        """
+        Convert character between rule systems using export/import.
+        Validates against target ruleset if system_loader is available.
+        """
         result = ValidationResult()
         
         # Load character
@@ -757,14 +840,36 @@ class CharacterManager:
             # Merge exported data
             character.update(exported_data)
             
-            # Re-validate after conversion
+            # Validate against target system if loader is available
+            if self.system_loader:
+                try:
+                    target_system = self.system_loader(target)
+                    target_validation = target_system.validate_character(character)
+                    target_result = self._normalize_validation_result(target_validation)
+                    
+                    if not target_result.is_valid:
+                        result.add_issue("Target system validation failed", 
+                                       ValidationSeverity.ERROR, code="TARGET_VALIDATION")
+                        result.issues.extend(target_result.issues)
+                        result.severity = max(result.severity, target_result.severity)
+                        result.is_valid = False
+                        return result
+                        
+                except Exception as e:
+                    result.add_issue(f"Target system validation error: {e}", 
+                                   ValidationSeverity.WARNING, code="TARGET_VALIDATION_ERROR")
+            
+            # Re-validate with current system after conversion
             validation_result = self.validate_character(character)
             
-            if validation_result.is_valid:
+            if validation_result.is_valid or validation_result.severity < ValidationSeverity.ERROR:
                 # Save converted character
                 save_result = self.save_character(character)
                 result.add_issue(f"Successfully converted character {character_id} to {target.value}", 
                                ValidationSeverity.INFO)
+                
+                # Invalidate cache to ensure fresh data
+                self.invalidate_cache(character_id)
                 
                 # Merge save issues
                 result.issues.extend(save_result.issues)
@@ -830,13 +935,19 @@ class CharacterManager:
     # ==========================================
     
     def get_cache_stats(self) -> Dict[str, Any]:
-        """Get cache performance statistics."""
+        """Get cache performance statistics with hit/miss tracking."""
         with self._lock:
+            total_requests = self._cache_hits + self._cache_misses
+            hit_ratio = (self._cache_hits / total_requests 
+                        if total_requests > 0 else 0.0)
+            
             return {
                 "size": len(self._character_cache),
                 "max_size": self.max_cache_entries,
                 "ttl": self.cache_ttl,
-                "hit_ratio": 0.0  # Would need hit/miss tracking
+                "hits": self._cache_hits,
+                "misses": self._cache_misses,
+                "hit_ratio": hit_ratio
             }
     
     def backup_character(self, character_id: str) -> bool:
@@ -862,11 +973,13 @@ class CharacterManager:
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit with cache flush."""
-        # Optional: save any cached characters
+        """Context manager exit with cache flush and metadata updates."""
+        # Save cached characters with fresh metadata
         with self._lock:
             for character_id, character in self._character_cache.items():
                 try:
+                    # Update metadata before saving
+                    self._update_metadata(character)
                     self._atomic_write_character(character_id, character)
                 except Exception as e:
                     self.logger.error(f"Failed to save cached character {character_id}: {e}")
