@@ -755,4 +755,4 @@ if __name__ == "__main__":
     assert info["version"] == "1.0.2b", f"Expected v1.0.2b, got {info['version']}"
     print(f" ✓ Metadata: version={info['version']}, crit_condition='{info['crit_condition']}'")
     
-    print("\n✅ All self-tests passed! DaggerheartRules v1.0.2b 
+    print("\n✅ All self-tests passed! DaggerheartRules v1.0.2b enhancements working correctly.")
