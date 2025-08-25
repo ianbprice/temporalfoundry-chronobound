@@ -1,11 +1,11 @@
 """
-ChronoBound CombatEngine v1.0.2
-===============================
+ChronoBound CombatEngine v1.0.2a
+================================
 
 Enhanced combat management with system-driven profiles, deterministic initiative,
 thread safety, action idempotency, and robust event handling.
 
-Key improvements in v1.0.2:
+Key improvements in v1.0.2a:
 - System-driven combat profiles with spotlight/initiative turn models
 - Deterministic initiative sorting with persistent tie-breakers  
 - Null-safe environment handling with default CombatEnvironment
@@ -14,8 +14,9 @@ Key improvements in v1.0.2:
 - Action idempotency via processed_action_ids set
 - Robust event emission with listener exception isolation
 - Enhanced export with lightweight mode, statistics, and state hashing
+- Deterministic tie-breakers; removed global randomness
 
-Version: 1.0.2
+Version: 1.0.2a
 Author: ChronoBound Development Team
 License: MIT
 """
@@ -32,7 +33,6 @@ from datetime import datetime, timedelta
 import copy
 import uuid
 from queue import Queue, Empty
-import random
 
 # Import our interfaces and modules
 from irulesystem_interface import IRuleSystem, RuleSystemType, ActionResult, AttackResult, Condition
@@ -121,7 +121,7 @@ class CombatParticipant:
     character_id: str
     character_data: Dict[str, Any]
     initiative: int
-    tie_breaker: int = field(default_factory=lambda: random.randint(1, 100))
+    tie_breaker: int
     is_pc: bool = True
     is_conscious: bool = True
     is_alive: bool = True
@@ -327,7 +327,7 @@ class CombatEngine:
         }
         
         # Engine version for export
-        self.engine_version = "1.0.2"
+        self.engine_version = "1.0.2a"
     
     def _get_combat_profile(self) -> CombatProfile:
         """Get combat profile from rule system with fallback."""
@@ -445,7 +445,7 @@ class CombatEngine:
                 raise CombatEngineError(f"Combat start failed: {e}")
     
     def _add_participant(self, participant_data: Dict[str, Any]):
-        """Add a participant to combat with tie-breaker generation."""
+        """Add a participant to combat with deterministic tie-breaker generation."""
         char_id = participant_data.get("id")
         if not char_id:
             raise CombatEngineError("All participants must have an 'id' field")
@@ -454,20 +454,28 @@ class CombatEngine:
         if any(p.character_id == char_id for p in self.participants):
             raise CombatEngineError(f"Participant {char_id} already in combat")
         
+        # Determine tie-breaker: use existing or compute deterministic value
+        if "_tie_breaker" in participant_data:
+            tie_breaker = participant_data["_tie_breaker"]
+        else:
+            # Stable, bounded 0..999
+            tie_breaker = int(hashlib.md5(char_id.encode()).hexdigest()[:6], 16) % 1000
+            participant_data["_tie_breaker"] = tie_breaker
+        
         is_pc = participant_data.get("type", "PC") == "PC"
         
         participant = CombatParticipant(
             character_id=char_id,
             character_data=copy.deepcopy(participant_data),
             initiative=0,  # Will be rolled later
-            tie_breaker=random.randint(1, 100),  # Deterministic tie-breaking
+            tie_breaker=tie_breaker,
             is_pc=is_pc,
             is_conscious=True,
             is_alive=True
         )
         
         self.participants.append(participant)
-        self.logger.debug(f"Added participant: {char_id} (tie_breaker: {participant.tie_breaker})")
+        self.logger.debug(f"Added participant: {char_id} (tie_breaker: {tie_breaker})")
     
     def roll_initiative(self) -> List[Tuple[str, int]]:
         """
