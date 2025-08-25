@@ -11,6 +11,7 @@ Changelog v1.0.2a:
 - Rule-system filtering uses prefix matching (not substring)
 - Cache flush updates metadata before save
 - Cache statistics track hit/miss ratios
+- Removed unreachable temp file guard in search_characters (glob already excludes .tmp)
 
 Key improvements in v1.0.2:
 - ValidationResult with IntEnum severity levels  
@@ -705,9 +706,6 @@ class CharacterManager:
         
         # Load all characters
         for char_file in self.storage_path.glob("*.json"):
-            if char_file.suffix == '.tmp':  # Skip temp files
-                continue
-                
             try:
                 character = self._load_character_from_disk(char_file.stem)
                 if character:
